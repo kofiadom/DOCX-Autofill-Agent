@@ -46,130 +46,157 @@ The DOCX Autofill Agent intelligently fills DOCX templates using data from sourc
 
 ## Three-Stage Architecture
 
-### Stage 1: AUTOMATION - Unpack & Discover
+### Stage 1: AUTOMATION - Unpack & Prepare
 
-**What happens**: Scripts extract template structure and identify placeholders.
+**What happens**: Scripts extract template structure and convert documents to readable format.
 
 **Steps**:
-1. User uploads `template.docx` to session input directory
+1. User uploads `template.docx` and optionally `source.docx` to session input directory
 2. Agent calls `unpack_template("template.docx")`
-3. Script calls `ooxml_scripts/unpack.py` which:
+3. SessionAwareDocxTools maps to: `workspaces/{session_id}/input/template.docx`
+4. Script calls `ooxml_scripts/unpack.py` which:
    - Extracts DOCX (ZIP archive) to XML directory
    - Preserves all formatting, styles, relationships
    - Creates structure: `word/document.xml`, `word/styles.xml`, etc.
-4. Agent calls `find_placeholders()`
-5. Script calls `scripts/extract_placeholders.py` which:
-   - Parses `word/document.xml` using Document Library (XMLEditor)
-   - Finds all `{{placeholder}}` text patterns
-   - Returns list of placeholders found
-6. If source document provided:
+5. If source document provided:
    - Agent calls `convert_docx_to_markdown("source.docx")`
-   - Script calls `scripts/docx_to_markdown.py` which:
-     - Uses pandoc to convert DOCX to markdown
-     - Preserves document structure and hierarchy
-     - Saves markdown to debug directory
+   - Calls pandoc to convert DOCX to markdown
+   - Preserves document structure and hierarchy
+   - Saves to: `workspaces/{session_id}/debug/source.md`
+6. Agent also converts template:
+   - Agent calls `convert_docx_to_markdown("template.docx")`
+   - Saves to: `workspaces/{session_id}/debug/template.md`
 
 **Output of Stage 1**:
 - Unpacked template XML: `workspaces/{session_id}/unpacked/template/`
-- Placeholder list: JSON list of placeholders
-- Source markdown: `workspaces/{session_id}/debug/source.md`
+- Template markdown: `workspaces/{session_id}/debug/template.md`
+- Source markdown: `workspaces/{session_id}/debug/source.md` (if source provided)
 
 **Files Used**:
-- `scripts/unpack_docx.py` (wrapper for local ooxml_scripts/unpack.py)
-- `scripts/extract_placeholders.py` (uses local lib/utilities.py XMLEditor)
-- `scripts/docx_to_markdown.py` (calls pandoc)
+- `ooxml_scripts/unpack.py` (extracts DOCX to XML)
+- `scripts/docx_to_markdown.py` (calls pandoc for conversion)
 
 ---
 
 ### Stage 2: LLM ANALYSIS - Understand & Map
 
-**What happens**: Agent reads documents and creates intelligent placeholder→value mappings.
+**What happens**: Agent applies semantic analysis to identify placeholders and create field mappings.
 
 **Steps**:
-1. Agent reads markdown of source document:
+1. Agent reads template markdown for semantic analysis:
    ```python
-   markdown_content = read_text_file("source.md")
+   template_content = read_text_file("template.md")
    ```
-2. Agent reads placeholder list from Stage 1:
+2. Agent analyzes template to identify ALL placeholder types:
+   - **Explicit markers**: `{{name}}`, `[Field]`, `__field__`, `<<text>>`
+   - **Implicit markers**: Lines of underscores, dots, spaces (visual empty fields)
+   - **Placeholder hints**: Text with "fill in", "enter", "provide", "specify"
+   - **Semantic gaps**: Labels without values ("Date:", "Signature:", etc.)
+3. If source document provided, Agent reads source markdown:
    ```python
-   placeholders_json = read_json_file("placeholders.json")
-   placeholders = json.loads(placeholders_json)
+   source_content = read_text_file("source.md")
    ```
-3. Agent analyzes both and creates intelligent mappings:
-   - Reads source markdown content
-   - Matches placeholder names to available data
-   - Extracts relevant values
-   - Handles different formats (dates, currencies, etc.)
-4. Agent creates mapping dictionary:
-   ```json
+4. Agent extracts values from source using 4-level matching:
+   - **Level 1**: Exact name match (case-insensitive)
+   - **Level 2**: Fuzzy name match (variations like "date" → "Start Date")
+   - **Level 3**: Context matching (financial values, date patterns, etc.)
+   - **Level 4**: Ask user (if no clear match found)
+5. Agent handles format conversions:
+   - Dates: "November 14, 2025" → "11/14/2025"
+   - Currency: "50000" → "$50,000"
+   - Names: "JOHN SMITH" → "John Smith"
+   - Numbers: "50000.00" → "50,000"
+6. Agent creates field mapping dictionary:
+   ```python
    {
-     "name": "John Smith",
-     "company": "Acme Corporation",
-     "amount": "$50,000",
-     "date": "2025-11-14"
+     "Project Manager": "John Smith",
+     "Date": "11/14/2025",
+     "Budget": "$50,000"
    }
    ```
-5. Agent calls `create_replacement_mapping(mapping_dict)`:
-   - Saves mapping as JSON to debug directory
-   - Validates all placeholders are covered
-   - Returns confirmation
-6. Agent calls `generate_preview()`:
-   - Shows what will be filled
-   - Format: `placeholder_name → value`
-   - Allows user to verify before applying
+7. Agent shows analysis to user for confirmation:
+   - Lists identified fields and extracted values
+   - Asks: "Is this correct? Any changes needed?"
+   - User can approve, adjust, or ask questions
 
 **Agent Responsibilities**:
-- Read and understand source document structure
-- Match placeholders intelligently (exact name match, fuzzy match, context-based)
-- Extract correct values in correct format
-- Handle edge cases (missing data, multiple possible matches)
-- Ask user for clarification if needed
+- Semantic analysis of template structure (not pattern matching)
+- Intelligent field identification with confidence levels
+- Semantic analysis of source document
+- Smart data extraction and matching using 4-level strategy
+- Format conversion and normalization
+- Transparent analysis presentation to user
+- Handling ambiguous cases with user clarification
 
 **Output of Stage 2**:
-- Replacement mapping: `workspaces/{session_id}/debug/replacements.json`
-- Preview shown to user
+- Field mapping: `field_mapping = {"label": "value", ...}`
+- Preview shown to user for confirmation
+- Ready for Stage 3 after user approval
 
-**Files Used**:
-- `read_text_file()` and `read_json_file()` tools (file system access)
-- `generate_preview()` tool (shows what will be filled)
+**Tools Used**:
+- `read_text_file()` - Read markdown files for analysis
 
 ---
 
 ### Stage 3: AUTOMATION - Fill & Pack
 
-**What happens**: Scripts apply replacements and create final DOCX.
+**What happens**: fill_fields tool applies field mapping and pack_template creates final DOCX.
+
+**Three-Layer Tool Architecture**:
+
+```
+Layer 2: Agent Tool Function
+  agents/docx_session_aware_tool_functions.py
+  fill_fields(run_context, field_mapping)
+         ↓
+Layer 3: Session Wrapper
+  agents/docx_session_tools.py
+  SessionAwareDocxTools.fill_fields(field_mapping)
+         ↓
+Layer 1: Core Business Logic
+  agents/docx_tools.py
+  fill_fields(unpacked_dir, field_mapping)
+         ↓
+Document Library
+  lib/document.py
+  Document class (uses ooxml_scripts)
+```
 
 **Steps**:
-1. Agent (after user approval) calls `fill_template()`:
-   - Reads replacement mapping from `replacements.json`
-   - Calls `scripts/fill_docx.py` which:
-     - Uses Document Library (lib/document.py) to open unpacked template
-     - For each placeholder→value pair:
-       - Finds XML run containing `{{placeholder}}`
-       - Replaces text while preserving all formatting
-       - Uses `get_node(tag="w:r", contains="{{placeholder}}")` method
-       - Uses `replace_node()` to maintain document structure
-     - Saves modified XML back to unpacked directory
-2. Agent calls `pack_template()`:
-   - Calls `scripts/pack_docx.py` which:
-     - Calls local `ooxml_scripts/pack.py`
-     - Re-packages XML directory back to DOCX
-     - Creates valid OOXML structure
-     - Saves to output directory: `workspaces/{session_id}/output/filled.docx`
+1. After user approves analysis, agent calls `fill_fields(field_mapping)`:
+   - Passes mapping dict like: `{"Project Manager": "John Smith", "Date": "11/14/2025"}`
+   - Tool locates unpacked template directory
+   - Imports Document Library from lib/document.py
+   - For each label→value in field_mapping:
+     - Finds paragraph containing label text
+     - Searches forward for first empty `<w:t>` (text) element
+     - Fills empty element with value
+     - Document Library preserves all formatting automatically
+   - Saves modified XML back to unpacked directory
+   - Returns status: "✅ Filled 3 field(s): Project Manager, Date, Budget"
+
+2. Agent calls `pack_template("filled.docx")`:
+   - Calls ooxml_scripts/pack.py
+   - Re-packages XML directory back to DOCX
+   - Creates valid OOXML structure with proper relationships
+   - Saves to: `workspaces/{session_id}/output/filled.docx`
+
 3. User downloads filled document
 
-**Why Formatting Is Preserved**:
-- Only text content (`<w:t>`) changes
-- XML structure (`<w:r>`, `<w:p>`, styles) unchanged
-- All formatting attributes preserved
-- Only replacement is minimal: placeholder text → actual value
+**Why Formatting Is Always Preserved**:
+- Document Library handles all XML infrastructure
+- Only text content (`<w:t>` elements) changes
+- XML structure (`<w:r>`, `<w:p>`, styles) completely preserved
+- All formatting attributes (bold, italic, colors, sizes) unchanged
+- Namespaces, RSID values, relationships all maintained
+- No manual XML manipulation required
 
 **Output of Stage 3**:
 - Filled DOCX: `workspaces/{session_id}/output/filled.docx`
 
-**Files Used**:
-- `scripts/fill_docx.py` (uses local lib/document.py Document Library)
-- `scripts/pack_docx.py` (wrapper for local ooxml_scripts/pack.py)
+**Tools Used**:
+- `fill_fields(field_mapping)` - Fills fields using Document Library (safe, automatic)
+- `pack_template(filename)` - Packs XML back to DOCX
 
 ---
 
@@ -605,25 +632,22 @@ cleanup()
 
 | Tool | Purpose | Input | Output |
 |------|---------|-------|--------|
-| `unpack_template(filename)` | Extract DOCX to XML | DOCX filename | Confirmation message |
-| `find_placeholders()` | Discover {{placeholders}} | (none) | JSON list of placeholders |
-| `convert_docx_to_markdown(filename, output_filename)` | Convert to markdown | DOCX filename, output name | Confirmation message |
+| `unpack_template(filename)` | Extract DOCX to XML structure | DOCX filename | "✅ Successfully unpacked..." |
+| `convert_docx_to_markdown(filename, output_filename)` | Convert DOCX to readable markdown | DOCX filename, output name | "✅ Successfully converted..." |
 
 #### Stage 2: Analysis Tools
 
 | Tool | Purpose | Input | Output |
 |------|---------|-------|--------|
-| `read_text_file(filename)` | Read text/markdown files | Filename | File contents |
-| `read_json_file(filename)` | Read JSON files | Filename | JSON contents |
-| `create_replacement_mapping(dict)` | Save placeholder→value mapping | Dictionary | Confirmation message |
-| `generate_preview()` | Show what will be filled | (none) | Formatted preview |
+| `read_text_file(filename)` | Read markdown/text files for analysis | Filename | File contents (first 10K chars) |
+| `read_json_file(filename)` | Read JSON configuration files | Filename | Parsed JSON content |
 
 #### Stage 3: Automation Tools
 
 | Tool | Purpose | Input | Output |
 |------|---------|-------|--------|
-| `fill_template()` | Apply replacements | (uses replacements.json) | Confirmation message |
-| `pack_template(filename)` | Create final DOCX | Output filename | File created confirmation |
+| `fill_fields(field_mapping)` | Fill empty fields using Document Library | Dict of {label: value} pairs | "✅ Filled X field(s): list... \| Skipped Y: list..." |
+| `pack_template(filename)` | Create final DOCX from unpacked XML | Output filename | "✅ Successfully packed to filename.docx" |
 
 #### Utility Tools
 
@@ -631,53 +655,53 @@ cleanup()
 |------|---------|-------|--------|
 | `list_input_files()` | See uploaded files | (none) | List of files in input/ |
 | `list_output_files()` | See generated files | (none) | List of files in output/ |
-| `get_session_info()` | Get workspace info | (none) | Session details |
-| `cleanup()` | Delete session workspace | (none) | Confirmation message |
+| `get_session_info()` | Get workspace paths and status | (none) | Session details and file counts |
+| `cleanup()` | Delete entire session workspace | (none) | "✅ Deleted..." or appropriate message |
 
 ---
 
 ## Data Structures
 
-### Placeholder List (Stage 1 Output)
+### Field Mapping (Stage 2 Output)
 
-```json
+The agent creates this dictionary based on semantic analysis:
+
+```python
 {
-  "placeholders": ["name", "company", "amount", "date"],
-  "count": 4
+  "Project Manager": "John Smith",
+  "Date": "11/14/2025",
+  "Budget": "$50,000",
+  "Company": "Acme Corporation"
 }
 ```
 
-### Replacement Mapping (Stage 2 Output)
+**Key Points**:
+- Keys are label text found in template (e.g., "Project Manager:")
+- Values are extracted and formatted values from source
+- Ready to pass directly to `fill_fields()` tool
+- Agent asks for user confirmation before using
 
-```json
-{
-  "name": "John Smith",
-  "company": "Acme Corporation",
-  "amount": "$50,000",
-  "date": "2025-11-14"
-}
-```
+### Fill Fields Tool Response (Stage 3)
 
-### Preview Output (Stage 2)
+After calling `fill_fields(field_mapping)`:
 
 ```
-Replacement Preview:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{{name}} → John Smith
-{{company}} → Acme Corporation
-{{amount}} → $50,000
-{{date}} → 2025-11-14
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✅ Filled 3 field(s): Project Manager, Date, Budget | Skipped 1: Salary
 ```
+
+**Interpretation**:
+- Filled fields: Successfully filled with values
+- Skipped fields: No empty field found after label search
+- Tool handles formatting preservation automatically
 
 ### Session Info (Utility)
 
 ```
 📋 Session Information:
-  - Session ID: user1_2025_11_14_001
-  - Input directory: workspaces/user1_2025_11_14_001/input
-  - Output directory: workspaces/user1_2025_11_14_001/output
-  - Debug directory: workspaces/user1_2025_11_14_001/debug
+  - Session ID: 785cc09b-9ade-4aef-b676-b05ee302750d
+  - Input directory: workspaces/785cc09b.../input
+  - Output directory: workspaces/785cc09b.../output
+  - Debug directory: workspaces/785cc09b.../debug
   - Input files: 2 file(s)
   - Output files: 1 file(s)
 ```
