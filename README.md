@@ -1,432 +1,420 @@
-# DOCX Autofill Agent with Agno
+# DOCX Autofill Agent
 
-A production-ready FastAPI web service that intelligently fills DOCX templates with data extracted from source documents using Claude AI.
+An intelligent Agno agent that fills DOCX templates with extracted data. Uses Claude AI to assess template complexity and automatically selects the best filling approach.
 
-**Status:** ✅ Ready to Launch
+**Status:** ✅ Production Ready
 **Version:** 1.0
-**Python:** 3.8+
+**Python:** 3.8+ | **Node.js:** 14+
 
-## Workflow Overview
+---
 
-The autofill process follows a **three-stage workflow** with clear separation between automation and LLM analysis:
+## Quick Overview
 
 ```
-┌──────────────────────┐
-│  STAGE 1: AUTOMATION │
-│      (Unpack)        │
-└──────┬───────────────┘
-       │ unpack_docx_script(template.docx)
-       ↓
-    workspaces/{session}/unpacked/template/
-    ├── word/document.xml
-    ├── word/styles.xml
-    └── [all DOCX XML files preserved]
-
-┌──────────────────────────┐
-│  STAGE 2: LLM ANALYSIS   │
-│  (Analyze & Map)         │
-└──────┬───────────────────┘
-       │ Agent reads: word/document.xml
-       │ Agent finds: {{placeholder_name}} patterns
-       │ Agent creates: replacements.json mapping
-       ↓
-    workspaces/{session}/debug/replacements.json
-    {
-      "employee_name": "John Smith",
-      "employee_id": "EMP12345"
-    }
-
-┌──────────────────────┐
-│  STAGE 3: AUTOMATION │
-│  (Fill & Pack)       │
-└──────┬───────────────┘
-       │ fill_docx_script(unpacked/, replacements.json)
-       │ Replaces {{placeholder}} with values
-       │ Preserves all formatting, styles, structure
-       ↓
-       │ pack_docx_script(unpacked/)
-       │ Converts back to DOCX ZIP format
-       ↓
-    workspaces/{session}/output/filled.docx
+Input: template.docx + source.docx (or manual mapping)
+         ↓
+    Agent reads template & source
+         ↓
+    Assess complexity: Simple or Professional?
+         ↓
+    LOW Complexity  →  Python fill_fields()     → Fast, XML-based
+    HIGH Complexity →  Node.js docx-js library  → Professional quality
+         ↓
+    Output: filled.docx (with all formatting preserved)
 ```
+
+---
+
+## 6-Phase Workflow
+
+The agent follows a structured 6-phase process:
+
+| Phase | What | How |
+|-------|------|-----|
+| **1** | Preparation & Setup | Unpack template, assess complexity (LOW vs HIGH) |
+| **2** | Data Extraction | Extract text, tables, form fields from source |
+| **3&4** | Complexity-Based Filling | LOW: fill_fields() / HIGH: docx-js |
+| **5** | Validation | 3-tier validation (placeholders, structure, XML) |
+| **6** | Output & Packaging | Pack to DOCX format |
+
+See **WORKFLOW.md** for detailed phase descriptions.
+
+---
+
+## Two Filling Approaches
+
+### LOW Complexity Templates
+**Use case:** Forms, simple letters, basic invoices
+- **Method:** Python `fill_fields()` with multi-strategy approach
+- **Speed:** Fast (1-3 seconds)
+- **Formatting:** All preserved
+- **Best for:** Simple templates with straightforward placeholders
+
+### HIGH Complexity Templates
+**Use case:** Professional reports, branded documents, multi-section charters
+- **Method:** Node.js `docx-js` library for fresh document generation
+- **Speed:** Slightly slower (3-5 seconds) but produces professional quality
+- **Formatting:** Original headers/footers/branding preserved
+- **Best for:** Complex layouts with multiple sections, headers/footers, company branding
+
+---
+
+## Installation
+
+### Prerequisites
+
+```bash
+# Python 3.8+
+python --version
+
+# Node.js 14+
+node --version
+npm --version
+```
+
+### Setup
+
+```bash
+# 1. Install Python dependencies
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+
+# 2. Install Node.js docx library
+npm install docx
+
+# 3. Install Pandoc (for markdown conversion)
+# Linux
+sudo apt-get install pandoc
+# macOS
+brew install pandoc
+# Windows
+choco install pandoc
+```
+
+---
+
+## Architecture
+
+### 3-Layer Design
+
+```
+┌─────────────────────────────────────┐
+│  Agent (docx_agent_with_sessions.py) │
+│  - Workflow instructions             │
+│  - Complexity-based decisions        │
+│  - 18 registered tools               │
+└──────────────────┬──────────────────┘
+                   │
+┌──────────────────┴──────────────────┐
+│ Layer 2: Tool Functions             │
+│ (docx_session_aware_tool_functions) │
+│ - Wrapper functions for agent       │
+│ - Converts results to JSON          │
+└──────────────────┬──────────────────┘
+                   │
+┌──────────────────┴──────────────────┐
+│ Layer 3: Session Manager            │
+│ (docx_session_tools)                │
+│ - Workspace isolation               │
+│ - Path resolution                   │
+│ - File operations                   │
+└──────────────────┬──────────────────┘
+                   │
+┌──────────────────┴──────────────────┐
+│ Layer 1: Core Logic                 │
+│ (docx_tools)                        │
+│ - XML manipulation                  │
+│ - Data extraction                   │
+│ - Field filling                     │
+│ - Document packing                  │
+└─────────────────────────────────────┘
+```
+
+### Session Isolation
+
+Each user has isolated workspace:
+
+```
+workspaces/{session_id}/
+├── input/       (uploaded files)
+├── unpacked/    (extracted XML)
+├── debug/       (intermediate files: extraction, field mapping, results)
+└── output/      (filled.docx)
+```
+
+---
+
+## 18 Registered Tools
+
+### File Discovery (3)
+- `list_input_files()` - See uploaded files
+- `list_output_files()` - See generated files
+- `get_session_info()` - Session workspace info
+
+### Phase 1: Preparation (3)
+- `unpack_template(filename)` - Extract DOCX to XML
+- `convert_docx_to_markdown(filename)` - Convert to markdown
+- `insert_placeholders(field_analysis)` - Auto-insert {{FIELD}} placeholders
+
+### Phase 2: Data Extraction (3)
+- `extract_all_data(filename)` - Extract text, tables, SDT fields
+- `read_text_file(filename)` - Read markdown/text files
+- `read_json_file(filename)` - Read debug JSON files
+
+### Phase 3/4: Filling (2)
+- `fill_fields(field_mapping)` - LOW complexity filling
+- `pack_template(filename)` - Pack to DOCX
+
+### Phase 4: High Complexity docx-js (3)
+- `read_lib_file(filename)` - Read lib/docx-js.md reference
+- `save_debug_file(filename, content)` - Save JS to disk
+- `run_node_script(script, output_path)` - Execute Node.js subprocess
+
+### Utilities (3)
+- `cleanup()` - Delete session workspace
+- `PythonTools()` - Complex Python analysis
+- `convert_docx_to_markdown()` - Markdown preview
+
+---
+
+## Usage
+
+### For Users
+
+1. **Upload template.docx** and optionally **source.docx**
+2. **Agent analyzes** and assesses complexity
+3. **Agent extracts** data from source (if provided)
+4. **Agent fills** template using appropriate approach
+5. **Download filled.docx**
+
+### For Developers
+
+See **WORKFLOW.md** for:
+- Detailed phase descriptions
+- Architecture overview
+- Quick start guide
+- Development tasks
+
+Key files to review:
+- `agents/docx_tools.py` - Core business logic
+- `agents/docx_session_tools.py` - Session management
+- `agents/docx_agent_with_sessions.py` - Agent instructions & tools
+- `lib/docx-js.md` - docx library reference (used by agent)
+
+---
 
 ## Key Features
 
-✅ **Standalone**: Includes all necessary OOXML utilities (unpack/pack/document library)
-✅ **Formatting Preserved**: Document structure, styles, fonts, colors maintained
-✅ **Session Isolated**: Each user gets private workspace (input/unpacked/debug/output)
-✅ **Two-Way Integration**: Can extract data from source documents OR accept manual mappings
-✅ **XML-Level Precision**: Uses Document Library for safe, precise text replacements
-✅ **No External Dependencies**: Only requires `defusedxml` (minimal, security-focused)
+✅ **Intelligent Complexity Assessment** - Automatically selects approach
+✅ **Two Filling Methods** - Speed (LOW) or Quality (HIGH)
+✅ **Complete Session Isolation** - Multi-user safe
+✅ **Comprehensive Data Extraction** - Text, tables, form fields
+✅ **Professional Output** - Headers/footers/branding preserved
+✅ **3-Tier Validation** - Ensures document integrity
+✅ **Anti-Hallucination** - Strict section structure adherence
+✅ **Debug Files** - Full transparency at each phase
 
-## Directory Structure
+---
+
+## How It Works
+
+### Complexity Assessment (Phase 1)
+
+Agent reads template markdown and assesses:
+
+- **LOW:** Single section, basic placeholders, minimal formatting
+  - ✅ Use Python fill_fields()
+
+- **HIGH:** Multiple sections, tables, headers/footers, complex formatting
+  - ✅ Use docx-js for fresh professional document
+
+### Data Extraction (Phase 2)
+
+Extracts from source using 3 methods:
+1. **Text extraction** - Paragraphs and runs
+2. **Table extraction** - Structured data
+3. **SDT extraction** - Form fields
+
+Results merged into `extracted_values` for mapping.
+
+### Template Filling (Phase 3 & 4)
+
+**LOW Complexity:**
+- Multi-strategy placeholder replacement
+- 5 different filling strategies for maximum coverage
+- Preserves all original formatting
+
+**HIGH Complexity:**
+- Generates fresh document using docx-js library
+- Copies headers, footers, media from original
+- Updates all relationships for proper display
+- Produces professional-quality output
+
+### Validation (Phase 5)
+
+Automatic 3-tier validation:
+1. **Placeholder Check** - All {{FIELD}} patterns removed
+2. **Structure Check** - Document XML structure intact
+3. **Well-Formedness** - XML is valid
+
+### Output (Phase 6)
+
+Packs filled XML back to DOCX format, ready for download.
+
+---
+
+## Important Implementation Details
+
+### Subprocess & Node.js Integration
+
+For HIGH complexity templates:
+```
+Agent creates JavaScript code
+    ↓
+save_debug_file() → saves to disk
+    ↓
+run_node_script() → Python subprocess.run(["node", script, output_path])
+    ↓
+Node.js executes, generates DOCX
+    ↓
+JavaScript saves via fs.writeFileSync()
+    ↓
+Headers/footers/branding copied from original
+    ↓
+Final DOCX ready
+```
+
+### Anti-Hallucination Safeguards
+
+Agent instructions explicitly prevent:
+- ❌ Adding sections not in original template
+- ❌ Removing sections
+- ❌ Modifying section structure
+- ✅ Filling existing sections with data
+- ✅ Leaving empty sections blank
+
+### Professional Filling Guidelines
+
+When filling templates:
+- ✅ Fill all sections that need data
+- ✅ Keep original formatting intact
+- ✅ Maintain professional appearance
+- ✅ Preserve authenticity (if quality not compromised)
+- ❌ DO NOT hallucinate content
+
+---
+
+## Troubleshooting
+
+**"Error reading file: docx-js.md"**
+- Agent must use `read_lib_file()` NOT PythonTools
+- This tool resolves correct file path dynamically
+
+**"File not found when running node script"**
+- JavaScript must be saved to disk BEFORE execution
+- Use `save_debug_file()` which returns full path
+- Pass returned path to `run_node_script()`
+
+**"Headers/footers not showing"**
+- Check relationship IDs are updated correctly
+- Verify media/ folder copied with correct rId mappings
+- Ensure [Content_Types].xml has header/footer entries
+
+**"Template filled but looks awkward"**
+- Check complexity was assessed correctly
+- LOW complexity should look fine
+- HIGH complexity should be professional with docx-js
+- Review Professional Filling Guidelines in agent instructions
+
+---
+
+## Project Structure
 
 ```
 Agno-DOCX-Autofill-Agent/
 ├── agents/
-│   ├── __init__.py
-│   ├── session_workspace.py      # Workspace manager for session isolation
-│   └── session_tools.py          # Tool implementations (unpack, find, fill, pack)
-│
-├── scripts/                      # Automation scripts called by tools
-│   ├── unpack_docx.py            # Unpack DOCX to XML
-│   ├── extract_placeholders.py   # Find {{placeholders}}
-│   ├── fill_docx.py              # Replace {{placeholders}} with values
-│   └── pack_docx.py              # Pack XML back to DOCX
-│
-├── ooxml_scripts/                # Local copy of document-skills OOXML utilities
-│   ├── unpack.py                 # Core unpacking logic
-│   ├── pack.py                   # Core packing logic
-│   ├── validate.py               # Validation utilities
-│   └── validation/               # Schema validators
-│
-├── lib/                          # Document Library from document-skills
-│   ├── utilities.py              # XMLEditor class for XML manipulation
-│   └── document.py               # High-level Document API
-│
-├── templates/                    # Template XML files for advanced features
-│   ├── comments.xml
-│   ├── commentsExtended.xml
-│   └── [other template files]
-│
-├── workspaces/                   # Session directories (auto-created)
-│   ├── {session_id}/
-│   │   ├── input/                # User uploaded files
-│   │   ├── unpacked/             # Unpacked DOCX work directory
-│   │   ├── debug/                # Analysis files (replacements.json)
-│   │   └── output/               # Final filled documents
-│
+│   ├── docx_agent_with_sessions.py     (Agent + tool registration)
+│   ├── docx_session_aware_tool_functions.py  (Layer 2: Tool functions)
+│   ├── docx_session_tools.py           (Layer 3: Session manager)
+│   ├── docx_tools.py                   (Layer 1: Core logic)
+│   ├── extraction_module.py
+│   ├── filling_strategies.py
+│   └── validation_module.py
+├── lib/
+│   ├── docx-js.md                      (docx library reference for agent)
+│   └── __init__.py
+├── scripts/
+│   └── pack_docx.py                    (Pack utility)
+├── ooxml_scripts/
+│   └── validation/                     (XML validation)
+├── workspaces/                         (Session directories - auto-created)
+├── package.json                        (npm: docx library)
+├── package-lock.json
+├── WORKFLOW.md                         (Complete workflow documentation)
 ├── requirements.txt
 └── README.md
 ```
 
-## Installation & Setup
-
-### 1. Install Dependencies
-
-```bash
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 2. Basic Usage
-
-```python
-from agents import SessionTools
-
-# Create tools for a session
-tools = SessionTools(session_id="user_123")
-
-# STAGE 1: AUTOMATION - Unpack template
-result = tools.unpack_template("template.docx")
-# Output: unpacked/template/ directory with all XML files
-
-# STAGE 2: LLM ANALYSIS - Find placeholders
-result = tools.find_placeholders()
-# Output: {"placeholders": ["employee_name", "employee_id", ...]}
-
-# Agent creates mapping from source data or user input
-tools.create_replacement_mapping({
-    "employee_name": "John Smith",
-    "employee_id": "EMP12345"
-})
-
-# STAGE 3: AUTOMATION - Fill and pack
-tools.fill_template()  # Replaces {{placeholder}} with values
-tools.pack_template()  # Converts back to DOCX
-# Output: output/template_filled.docx
-```
-
-## The Three Stages Explained
-
-### Stage 1: AUTOMATION - Unpack
-
-**What happens:**
-- DOCX file (ZIP archive) is extracted
-- All XML files are pretty-printed for readability
-- Document structure preserved exactly
-
-**Scripts involved:**
-- `scripts/unpack_docx.py` → calls `ooxml_scripts/unpack.py`
-
-**Output:**
-```
-unpacked/template/
-├── _rels/
-├── word/
-│   ├── document.xml          ← Contains all text and placeholders
-│   ├── styles.xml            ← Formatting definitions
-│   ├── numbering.xml
-│   ├── media/                ← Images, embedded files
-│   └── ...
-└── [Content_Types].xml
-```
-
-### Stage 2: LLM ANALYSIS - Understand & Map
-
-**What happens:**
-- Agent reads unpacked `word/document.xml`
-- Agent extracts all `{{placeholder_name}}` patterns
-- Agent analyzes template structure
-- Agent creates `replacements.json` mapping placeholder→value
-
-**Tools involved:**
-- `tools.find_placeholders()` - Extracts all placeholder names
-- `tools.create_replacement_mapping()` - Agent writes mapping
-
-**Output:**
-```json
-{
-  "employee_name": "John Smith",
-  "employee_id": "EMP12345",
-  "start_date": "2025-11-14",
-  "salary": "$95,000"
-}
-```
-
-### Stage 3: AUTOMATION - Fill & Pack
-
-**What happens:**
-- Script reads `replacements.json`
-- Script finds all `{{placeholder}}` in XML text nodes
-- Script replaces with actual values
-- XML is validated and condensed
-- Directory is repackaged into DOCX ZIP
-
-**Scripts involved:**
-- `scripts/fill_docx.py` - Performs replacements
-- `scripts/pack_docx.py` → calls `ooxml_scripts/pack.py`
-
-**Important**: Only text content is modified; all formatting, styles, and structure remain intact.
-
-## Placeholder Syntax
-
-In your DOCX template, use:
-
-```
-{{placeholder_name}}
-```
-
-**Rules:**
-- Placeholder name is case-sensitive
-- Only alphanumeric and underscore characters allowed: `[a-zA-Z0-9_]`
-- Will be replaced with corresponding value from mapping
-- Can appear anywhere in document text
-
-**Examples:**
-```
-Hello {{first_name}} {{last_name}}!
-Your ID: {{employee_id}}
-Salary: {{salary}}
-Date: {{hire_date}}
-```
-
-## Why Formatting is Preserved
-
-The key to preserving formatting is the **unpack→modify→pack** workflow:
-
-1. **Unpack** extracts entire DOCX with ALL XML files (styles, formatting, relationships)
-2. **Modify** only changes text content in `word/document.xml` text nodes
-3. **Pack** reconstructs DOCX with all original files intact
-
-This means:
-- ✅ Font sizes, colors, styles preserved
-- ✅ Tables, images, headers/footers preserved
-- ✅ Numbering, bullet points preserved
-- ✅ Page layouts, margins preserved
-- ✅ Only text values change
-
-## Session Isolation
-
-Each user session has completely isolated workspaces:
-
-```
-workspaces/
-├── user_alice/
-│   ├── input/          (Alice's uploaded files)
-│   ├── unpacked/       (Alice's working directory)
-│   ├── debug/          (Alice's analysis files)
-│   └── output/         (Alice's filled documents)
-│
-└── user_bob/
-    ├── input/          (Bob's uploaded files)
-    ├── unpacked/       (Bob's working directory)
-    ├── debug/          (Bob's analysis files)
-    └── output/         (Bob's filled documents)
-```
-
-**Benefits:**
-- Multiple users can work simultaneously
-- No file interference between sessions
-- Easy cleanup: `SessionTools.cleanup()`
-- Perfect for shared/multi-user systems
-
-## Integration with Agno Agent Framework
-
-This codebase is designed to integrate with Agno AgentOS:
-
-```python
-from agno import Agent
-from agents import SessionTools
-
-# Agno agent calls these tools
-def docx_agent():
-    agent = Agent(
-        name="DOCX Autofill",
-        model="claude-sonnet-4.5",
-        tools=[
-            # Register session-aware tools
-            unpack_template_tool,
-            find_placeholders_tool,
-            create_mapping_tool,
-            fill_and_pack_tool,
-            # ... etc
-        ]
-    )
-```
-
-## Example Workflow
-
-### Simple Form Filling
-
-```
-User: "I have a template.docx with {{name}}, {{email}}, and {{date}}.
-       Please fill it with: name='John Smith', email='john@example.com', date='2025-11-14'"
-
-Agent:
-1. Unpacks template.docx using scripts/unpack_docx.py
-   → Creates unpacked/template/ directory with all XML
-
-2. Finds placeholders using scripts/extract_placeholders.py
-   → Returns: ["name", "email", "date"]
-
-3. Creates replacement mapping
-   → Saves to debug/replacements.json
-
-4. Shows preview to user
-   → Confirms: name → John Smith, email → john@example.com, date → 2025-11-14
-
-5. Fills template using scripts/fill_docx.py
-   → Replaces {{name}}, {{email}}, {{date}} in word/document.xml
-
-6. Packs result using scripts/pack_docx.py
-   → Creates output/template_filled.docx with all formatting intact
-```
-
-## Technical Implementation Details
-
-### Unpack/Pack Pattern
-
-The solution uses the **OOXML Unpack/Pack Pattern** from document-skills:
-
-```
-DOCX (ZIP Archive)
-        ↓ unpack.py
-     XML Files (pretty-printed)
-        ↓ [modify text nodes]
-     XML Files (modified)
-        ↓ pack.py
-   DOCX (ZIP Archive)
-```
-
-### XML Manipulation
-
-The `fill_docx.py` script uses Python's `xml.etree.ElementTree` to:
-- Parse `word/document.xml`
-- Find all `<w:t>` (text) nodes
-- Replace `{{placeholder}}` with actual values
-- Preserve all XML structure and attributes
-
-### Automation vs Analysis
-
-| Stage | Type | Who/What | Output |
-|-------|------|---------|--------|
-| 1 | AUTOMATION | Script runs unpack.py | unpacked/template/ |
-| 2 | LLM ANALYSIS | Agent reads XML, creates mapping | debug/replacements.json |
-| 3 | AUTOMATION | Scripts run fill_docx.py + pack.py | output/filled.docx |
-
-## File Structure Details
-
-### ooxml_scripts/ (Copied from document-skills)
-
-Contains the core unpack/pack utilities:
-- `unpack.py` - Extracts DOCX ZIP and formats XML
-- `pack.py` - Condenses XML and creates DOCX ZIP
-- `validate.py` - Optional schema validation
-- `validation/` - XSD schema validators
-
-### lib/ (Copied from document-skills)
-
-Contains the Document Library:
-- `utilities.py` - XMLEditor class for DOM manipulation
-- `document.py` - High-level Document API
-
-### templates/ (Copied from document-skills)
-
-Pre-made XML template files for:
-- Comments and comment replies
-- Extended/extensible comments
-- People tracking for tracked changes
-
-These are used by `document.py` for advanced features.
+---
 
 ## Requirements
 
-### Core Dependencies
-- `defusedxml` - Secure XML parsing (minimal package)
-- Python 3.7+
+### Python Packages
+- python-docx
+- lxml
+- defusedxml
 
-### Optional
-- `lxml` - For schema validation (included in validation modules if used)
-- `soffice` (LibreOffice) - For document validation (optional, pack.py works without it with `--force`)
+### System Requirements
+- Pandoc (for markdown conversion)
+- Python 3.8+
+- Node.js 14+
 
-## Standalone Nature
-
-This codebase is **completely standalone**:
-- ✅ All necessary scripts are included locally
-- ✅ No external calls to document-skills directory
-- ✅ No complex dependencies
-- ✅ Can be deployed as a complete unit
-- ✅ Works offline (no network calls needed)
-
-## Security Considerations
-
-- **XML Safety**: Uses `defusedxml` for secure XML parsing (prevents billion laughs attacks)
-- **Path Validation**: Filenames sanitized, no directory traversal
-- **Session Isolation**: Cannot access other sessions' files
-- **No Code Execution**: Only XML manipulation, no eval/exec
-
-## Troubleshooting
-
-### "document.xml not found"
-- Ensure DOCX file is valid (open in Word/LibreOffice)
-- Check file hasn't been corrupted
-
-### "Placeholders not found"
-- Verify template uses `{{placeholder}}` syntax
-- Check placeholder names are spelled correctly
-- Ensure XML wasn't corrupted during unpacking
-
-### "File not found in session"
-- Use `SessionTools.list_input_files()` to see available files
-- Check filename spelling
-- Verify file was uploaded to same session
-
-## Next Steps for Enhancement
-
-The current implementation handles basic autofill. Potential enhancements:
-
-- Tracked changes (mark filled cells with insertions)
-- Comments (add comments to filled fields)
-- Batch filling (fill multiple templates with CSV data)
-- Template validation (check template is valid before filling)
-- Data extraction (auto-extract data from source DOCX)
-
-## License
-
-Based on document-skills framework. Use according to document-skills LICENSE.txt terms.
+### npm Packages
+- docx
 
 ---
 
-**Built for intelligent document automation with Claude** 📄✨
+## Key Differences from Older Approaches
+
+| Aspect | Old | New |
+|--------|-----|-----|
+| **Phases** | 3 stages | 6 phases |
+| **Complexity** | Single approach | LOW vs HIGH |
+| **Quality** | Basic XML filling | Professional docx-js |
+| **Headers/Footers** | Not preserved | Preserved (HIGH) |
+| **Speed** | Fast but limited | Optimized per complexity |
+| **Output Quality** | Consistent | Professional (HIGH) |
+
+---
+
+## For New Developers
+
+1. **Start with:** WORKFLOW.md (375 lines, quick read)
+2. **Understand:** 6-phase workflow and complexity decision
+3. **Review:** Agent instructions in docx_agent_with_sessions.py (lines 100-420)
+4. **Explore:** docx_tools.py for core logic
+5. **Add features:** Follow pattern in Common Development Tasks in WORKFLOW.md
+
+---
+
+## Summary
+
+**DOCX Autofill Agent** is an intelligent system that:
+
+1. ✅ Automatically assesses template complexity
+2. ✅ Selects optimal filling approach
+3. ✅ Extracts data using 3 methods
+4. ✅ Fills templates with professional quality
+5. ✅ Validates output integrity
+6. ✅ Produces perfect DOCX files
+
+**Innovation:** Complexity-based decision logic provides both speed and quality.
+
+**Architecture:** 3-layer design enables scalable multi-user processing.
+
+**Key Tech:** Python + Node.js + Agno Agent Framework.
+
+---
+
+**Built for intelligent document automation** 📄✨

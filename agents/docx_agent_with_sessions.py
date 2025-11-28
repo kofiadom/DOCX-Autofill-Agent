@@ -11,6 +11,8 @@ from agno.agent import Agent
 from agno.db.sqlite import SqliteDb
 from agno.models.anthropic import Claude
 from agno.tools.python import PythonTools
+from agno.tools.toolkit import Toolkit
+import subprocess
 
 # Session-aware tool functions (Layer 2)
 from .docx_session_aware_tool_functions import (
@@ -19,15 +21,62 @@ from .docx_session_aware_tool_functions import (
     get_session_info,
     unpack_template,
     convert_docx_to_markdown,
+    insert_placeholders,
     pack_template,
     read_json_file,
     read_text_file,
+    read_lib_file,
+    extract_all_data,
     fill_fields,
+    save_debug_file,
     cleanup,
 )
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+class DocxJsTools(Toolkit):
+    """Custom toolkit for executing JavaScript generation scripts via Node.js."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            tools=[self.run_node_script],
+            *args,
+            **kwargs,
+        )
+
+    def run_node_script(self, script_path: str, output_path: str = None) -> str:
+        """
+        Run a JavaScript file using Node.js.
+
+        Executes a JavaScript file using Node.js subprocess and captures the output.
+        Used for docx-js fallback when XML parsing fails.
+
+        Args:
+            script_path: Path to the JavaScript file to execute (e.g., "generate_docx.js")
+            output_path: Optional path for script output (e.g., path to save DOCX in debug dir)
+                        Passed as command-line argument to script
+
+        Returns:
+            The output from running the script (stdout or error message)
+        """
+        try:
+            cmd = ["node", script_path]
+            if output_path:
+                cmd.append(output_path)
+
+            result = subprocess.run(
+                cmd,
+                shell=False,
+                capture_output=True,
+                text=True
+            )
+            if result.returncode != 0:
+                return f"Error: {result.stderr}"
+            return result.stdout
+        except Exception as e:
+            return f"Error running script: {e}"
 
 
 def _build_session_agent_instructions():
@@ -52,9 +101,17 @@ Important files created in debug/:
 - template.md: Markdown version of template document
 (These are used for analysis before writing XML-filling code)
 
-## Three-Stage Workflow
+## Six-Phase Workflow
 
-### STAGE 1: AUTOMATION - UNPACK & PREPARE
+The workflow varies based on template complexity (decided in Phase 1, Step 3):
+
+**For LOW Complexity Templates**: Phases 1 → 2 → 3 → 5 (validation) → 6
+**For HIGH Complexity Templates**: Phases 1 → 2 → 4 (docx-js includes validation) → 6
+
+Phase 4 (docx-js) includes validation internally (fresh XML is always valid)
+Phase 5 (validation) only applies to Phase 3 fill_fields approach
+
+### PHASE 1: PREPARATION & SETUP
 1. Call `unpack_template("template.docx")` - Extract DOCX to XML
    - Creates unpacked/template/ directory with all XML files
    - Preserves all formatting, styles, relationships
@@ -65,316 +122,326 @@ Important files created in debug/:
    - Preserves document structure and hierarchy
    - Use this for semantic analysis
 
-3. If user provided source: Call `convert_docx_to_markdown("source.docx", "source.md")`
+3. **Placeholder Detection & Complexity Assessment:**
+   - Read the template markdown: `read_text_file("template.md")`
+   - Check if template has explicit placeholders ({{FIELD}}, [FIELD], etc.)
+
+   **If placeholders ALREADY EXIST:**
+   - Skip to step 4 (no insertion needed)
+   - Proceed to Phase 2 data extraction
+
+   **If placeholders are MISSING:**
+   - Analyze template COMPLEXITY LEVEL:
+
+     **LOW COMPLEXITY** (Simple template):
+     - Few sections (< 5)
+     - Simple structure (mostly text)
+     - Clear field labels ("Name:", "Date:", etc.)
+     - Limited tables or special formatting
+     - Minimal styling/branding elements
+
+     → Use `insert_placeholders()` approach:
+       * Identify field labels and empty spaces
+       * Name fields semantically
+       * Call insert_placeholders() with field analysis
+       * Tool inserts {{FIELD_NAME}} placeholders
+       * Proceed to standard fill_fields() workflow
+
+     **HIGH COMPLEXITY** (Professional template):
+     - Multiple sections (5+)
+     - Complex structure (tables, nested content)
+     - Multiple tables with different purposes
+     - Headers, footers, page numbering, branding
+     - Extensive styling and professional formatting
+     - Multi-page document with section breaks
+
+     → Use `docx-js` approach INSTEAD:
+       * DO NOT use insert_placeholders()
+       * Create fresh professional document using docx-js library
+       * Skip to PHASE 3: DOCX-JS APPROACH workflow (lines 226-305)
+       * Reason: Complex templates need proper structure, can't be patched with simple placeholder insertion
+       * Result: Professional appearance, proper formatting preserved
+
+4. If user provided source: Call `convert_docx_to_markdown("source.docx", "source.md")`
    - Converts DOCX to markdown for easy reading
    - Saves to debug/source.md
    - Preserves document structure and hierarchy
 
-### STAGE 2: LLM SEMANTIC ANALYSIS - IDENTIFY PLACEHOLDERS & MAP DATA
-This is YOUR critical stage to apply intelligence.
+### PHASE 2: DATA EXTRACTION
+Extract data from source document using all available methods.
 
-**IMPORTANT:** You identify placeholders through semantic analysis of the template, not automated pattern matching.
+Call `extract_all_data("source.docx")` to get:
+- Text content from document
+- Table data (rows and cells)
+- Structured Data Tag (SDT) fields - Word form fields
+- Merged extracted values
 
-1. **Read the template markdown**
-   - template_content = read_text_file("template.md")
-   - Study structure, identify sections that need filling
+The function intelligently combines all three extraction methods and returns the best matches.
 
-2. **Analyze for ALL placeholder types:**
+Example:
+```python
+data = extract_all_data("source.docx")
+# Returns:
+# {
+#     'text': 'Full document text...',
+#     'tables': [[row1], [row2], ...],
+#     'sdt_fields': {'FieldName': 'value', ...},
+#     'extracted_values': {'field_name': 'value', ...}
+# }
+```
 
-   a) **Explicit Markers (High Confidence):**
-      - {{name}}, {{field}}, [Name], [Field], __name__, <<field>>, `name`, etc.
-      - Look for ANY text wrapped in special characters/brackets
+### PHASE 3: TEMPLATE FILLING & VALIDATION (For LOW Complexity Only)
 
-   b) **Implicit Markers (High Confidence):**
-      - Lines of underscores: "Company: _________________"
-      - Lines of dots: "Date: ..........................."
-      - Lines of spaces: "Title:                        "
-      - Context + visual: "Please enter your name: ___"
+This phase applies only to LOW complexity templates that have placeholders.
 
-   c) **Placeholder Hints (Medium Confidence):**
-      - Text says "fill in", "enter", "type", "provide", "specify", "select"
-      - Instructions like "[[add your information]]", "[provide date]"
-      - Form-like structure with labels and empty space
+For HIGH complexity templates, skip to PHASE 4: DOCX-JS APPROACH section instead.
 
-   d) **Semantic Gaps (Low-Medium Confidence):**
-      - Labels without values: "Signature:", "Date:", "Phone:" (with no content after)
-      - Empty cells in tables
-      - Sections marked for completing information
-      - Context suggests what type of data belongs there
+**Step 3a: Map Data to Template Fields**
+1. Read the extracted_values from Phase 2 extraction
+2. Read template markdown: `read_text_file("template.md")`
+3. Identify all {{FIELD}} placeholders (inserted in Phase 1.3 or originally present)
+4. Map extracted_values to template placeholders intelligently:
+   - Match field names semantically
+   - Handle variations (underscore vs space, upper vs lower case)
+5. Create field_mapping: {"FIELD_NAME": "value", ...}
+6. Confirm mapping with user before proceeding to Step 3b
 
-3. **If source document provided: Extract data**
-   - Read source markdown: source_content = read_text_file("source.md")
-   - Find fields/sections in source that match template placeholders
-   - Use four-level matching strategy (below)
+**IMPORTANT - Professional Filling Guidelines**:
 
-4. **Create intelligent mappings** - Use these strategies IN ORDER:
+When filling the template, follow these principles:
+- **Fill comprehensively**: Complete every section that needs data, regardless of what the source document mentions, EXCEPT where the text is clearly just an instruction/example (not an actual field to fill)
+- **Maintain professionalism**: Keep the template's original format and structure intact while ensuring the filled content looks polished and professional
+- **Be complete**: Ensure you have filled every data section/field that should contain information
+- **Preserve authenticity**: Keep the template's original formatting, fonts, styles, colors, and layout exactly as they were (if it won't interfere with the quality of filling)
+- **Follow structure**: Respect the original document's intended structure and hierarchy
+- **Critical instruction**: Make sure you have filled every section that needs to be filled (regardless of the source mentioned in the template) EXCEPT where it only looks like an instruction and not a field/section to be filled
+- **NO HALLUCINATION**: Do not add, remove, or modify sections. Only work with sections that exist in the original template. If a section has no data to fill, leave it empty.
 
-   a) **Exact Name Match (First Priority)**
-      - {{company}} → Look for "Company:" or "company:" in source
-      - Case-insensitive: match both "Company" and "company" to {{company}}
+**Step 3b: Fill Template with Data**
 
-   b) **Fuzzy Name Match (Second Priority)**
-      - {{company}} → try "company_name", "company_full", "organization", "org", "vendor"
-      - {{amount}} → try "total", "grand_total", "amount_due", "total_amount"
-      - {{date}} → try "date_signed", "effective_date", "date_created"
-      - {{name}} → try "full_name", "client_name", "employee_name"
-      - {{title}} → try "job_title", "position", "role"
-
-   c) **Context Match (Third Priority)**
-      - {{amount}} in financial document → look for currency values ($, amounts with commas)
-      - {{date}} → look for date patterns (11/14/2025, November 14, 2025, 2025-11-14)
-      - {{name}} → look for capitalized person names
-      - {{company}} → look for business/organization names
-
-   d) **Ask User (Last Resort)**
-      - "I found {{company}} in template but it's unclear which source field contains the company data."
-      - Show what you found: "Found these fields: company_name, vendor_name, organization"
-      - Ask: "Which one should I use?"
-
-4. **Handle different value formats**
-
-   Don't just extract - format correctly:
-
-   - **Dates:**
-     - If source is "2025-11-14" but template shows "11/14/2025" format, convert
-     - Try to detect expected format from source examples
-     - When uncertain, ask: "Should {{date}} be formatted as 11/14/2025 or 2025-11-14?"
-
-   - **Currency:**
-     - If source is "50000" and template likely needs "$ amount", add formatting
-     - If source is "50000.50" but template shows whole numbers, round appropriately
-     - Ask if unsure: "Should {{amount}} include cents or be a whole number?"
-
-   - **Names:**
-     - If source is "JOHN SMITH", convert to "John Smith" (proper case)
-     - Preserve source case only if clearly intentional
-
-   - **Numbers:**
-     - If source is "50000" and template shows "50,000" format, add thousands separator
-     - If source is "50000.00" and template shows no decimals, round to whole number
-
-5. **Handle missing data**
-
-   If {{placeholder}} has no matching source data:
-
-   Option A: Try alternative names - Maybe "vendor" field exists under different name?
-   Option B: Ask user - "I couldn't find data for {{company}}. What should I use?"
-   Option C: Provide educated guess - "I'll use 'Not provided' for {{company}}"
-   Option D: Skip - "{{salary}} will remain unfilled"
-
-   NEVER assume - always show what you're doing.
-
-6. **Show user your analysis**
-   - Ask: "I identified these sections that need filling and the data to use. Correct?"
-   - Show what you found and how you analyzed it
-   - Let user confirm or adjust your analysis before proceeding
-
-### STAGE 3: AUTOMATION - FILL & PACK TEMPLATE
-
-After user confirms analysis, fill fields using the fill_fields tool:
-
-1. **Call fill_fields(field_mapping)** where field_mapping is a dict:
-   ```
+1. **Call fill_fields(field_mapping)** with your mapping:
+   ```python
    {
-       "label_text": "extracted_value",
        "Project Manager": "John Smith",
        "Date": "11/14/2025",
        "Budget": "$50,000"
    }
    ```
 
-2. **Tool fills automatically:**
-   - For each label: finds paragraph containing that label
-   - Searches forward for first empty field (empty `<w:t>` node)
-   - Fills empty field with corresponding value
-   - Preserves all formatting (bold, italic, colors, fonts, sizes)
-   - Uses Document Library for safe XML manipulation
+2. **Tool uses 6 filling strategies:**
+   - Strategy A: Text placeholder replacement ({{FIELD}})
+   - Strategy B: Structured Data Tag (SDT) field replacement
+   - Strategy C: Element ID-based targeting
+   - Strategy D: Multi-run placeholder handling (placeholders split across runs)
+   - Strategy E: Table row filling
+   - Strategy F: Conditional content
 
-3. **Tool returns result:**
-   ```
-   "FILLED 3 field(s): Project Manager, Date, Budget | SKIPPED 1: Salary"
-   ```
+3. **Tool validates automatically:**
+   - Tier 1: Checks placeholders are filled
+   - Tier 2: Verifies document structure integrity
+   - Tier 3: Validates XML well-formedness
+   - Returns success/partial/failed status
 
-4. **Call pack_template("filled.docx"):**
-   - Packs the filled template back to DOCX
-   - Saves to output/filled.docx
-   - Document ready for download
+### PHASE 4: DOCX-JS APPROACH (For HIGH Complexity Templates Only)
 
-**Key Points:**
-- Use fill_fields() tool
-- Document Library handles all XML complexity
-- Formatting always preserved
-- Works with any document layout: forms, tables, complex structures
+This phase applies only to HIGH complexity templates (assessed in Phase 1, Step 3).
 
-## Tool Functions Available
+For LOW complexity templates, proceed to Phase 3 instead.
 
-### File Discovery
-- `list_input_files()` - See what user uploaded
-- `list_output_files()` - See generated documents
-- `get_session_info()` - Get workspace paths and status
+The **docx-js approach** is used in TWO scenarios:
 
-### Stage 1 - Automation & Preparation
+### Scenario 1: High Complexity Templates (Preferred Approach)
+This is the PRIMARY use case, decided in Phase 1, Step 3.
+
+**When to use**:
+- Template was assessed as HIGH COMPLEXITY in Phase 1
+- Has multiple sections, tables, headers/footers, professional formatting
+- Simple placeholder insertion cannot maintain quality
+- Need to create fresh, properly structured document
+
+**Why docx-js is better**:
+- Creates fresh XML structure (maintains formatting integrity)
+- Full control over styling, layout, and appearance
+- docx library handles all formatting complexity automatically
+- Professional appearance guaranteed
+- Headers, footers, branding easily preserved from original template
+
+### Scenario 2: Fallback for XML Errors (Emergency Recovery)
+This is the SECONDARY use case, triggered by errors.
+
+**When to use**:
+- `fill_fields()` or `pack_template()` fails with XML parsing errors
+- Document has corrupted or non-standard XML structure
+- Must recover and deliver document anyway
+
+### Solution: Use docx-js Library to Create Fresh Professional Document
+
+**Step 1: Read docx-js.md Documentation**
+- Call: `read_lib_file("docx-js.md")` ← Use this tool, NOT PythonTools
+- Learn Document, Paragraph, TextRun, Table, Header, Footer components
+- Understand critical formatting rules (never use \n, ShadingType.CLEAR for tables, etc.)
+
+**Step 2: Create JavaScript Generation Script**
+- Create a JavaScript file that uses the `docx` library to build document from scratch
+- Use field_mapping to populate the document with extracted data
+- Include proper formatting, styles, margins, spacing
+- **CRITICAL - NO HALLUCINATION**: Only include sections that exist in the original template. Do not add, remove, or modify sections. If a section has no data to fill, leave it empty.
+- **CRITICAL**: Include this code to save file to disk:
+  ```javascript
+  const { Packer } = require('docx');
+  const fs = require('fs');
+  Packer.toBuffer(doc).then(buffer => {
+      const outputPath = process.argv[2];
+      fs.writeFileSync(outputPath, buffer);
+      console.log(`Document created: ${outputPath}`);
+  });
+  ```
+
+**Step 3: Save and Execute JavaScript**
+- Call: `save_debug_file("generate_docx.js", javascript_code)` ← Use this tool, NOT PythonTools
+  - This saves the file to the session's debug directory
+  - Returns the full path where file was saved
+- Call: `run_node_script("generate_docx.js", debug_path/temp_document.docx")`
+  - Passes the full debug path as command-line argument to script
+  - Script saves DOCX using fs.writeFileSync()
+  - Verify success: Check returncode == 0
+
+**Step 4: IMPORTANT - Preserve Headers, Footers, and Branding from Original Template**
+
+**MUST DO**: Copy headers, footers, media from original template. This requires careful updates to relationships for headers/footers to display properly.
+
+**Reliable approach that works** (verified method):
+  1. Unpack both original template and newly created docx-js document
+  2. Copy header*.xml, footer*.xml files from original
+  3. Copy word/media/ folder (all logos and images) from original
+  4. Copy header*.xml.rels and footer*.xml.rels relationship files from original
+  5. Update word/document.xml.rels: Add relationship entries for each header/footer (rId references)
+  6. Update [Content_Types].xml: Add Override entries for header and footer content types
+  7. Update word/document.xml's w:sectPr section properties: Add headerReference and footerReference elements
+  8. Ensure all image rIds in header/footer .rels match the media files in word/media/
+  9. Repack to final DOCX
+
+**Key to success**: After copying, verify that all relationship IDs are correct. Incorrect relationship IDs are why headers/footers won't display even if files are present.
+
+### Example Workflow (For High Complexity Templates)
+
+```
+Phase 1, Step 3: Read template.md
+  ↓
+No explicit placeholders detected
+  ↓
+Assess complexity: Multiple sections (6+), multiple tables, headers/footers
+  ↓
+Complexity = HIGH
+  ↓
+Decision: Use docx-js approach (NOT insert_placeholders)
+  ↓
+Extract data from source
+  ↓
+[Read /lib/docx-js.md completely]
+  ↓
+Create generate_docx.js with field_mapping data
+  ↓
+run_node_script("generate_docx.js", debug_path/temp_document.docx)
+  ↓
+temp_document.docx created (fresh, properly formatted)
+  ↓
+Unpack original template (has headers/footers/branding)
+  ↓
+Unpack temp_document.docx
+  ↓
+Copy headers, footers, media from original → temp_document
+  ↓
+Update relationships and content types
+  ↓
+Repack → output.docx (with data + original formatting)
+```
+
+### Why docx-js Works Well for High Complexity Templates
+
+✅ Creates fresh XML structure (properly handles complex formatting)
+✅ docx library handles all formatting complexity automatically
+✅ Full control over styling, layout, and appearance
+✅ Original template formatting (headers/footers/branding) preserved separately
+✅ Professional appearance guaranteed
+✅ Guaranteed valid, well-formed output
+
+### docx-js Library Reference
+
+Located in: `/lib/docx-js.md`
+
+Key components:
+- `Document` - Root container with sections
+- `Paragraph` - Text blocks (never use \n for line breaks)
+- `TextRun` - Styled text within paragraphs
+- `Table` - Data tables with borders and formatting
+- `Header` / `Footer` - Section headers and footers
+- `Packer.toBuffer()` - Export to .docx
+
+### PHASE 5: VALIDATION & ERROR RECOVERY
+
+**For LOW Complexity Templates** (after Phase 3 fill_fields):
+
+Validation for LOW complexity templates is performed automatically by the fill_fields() tool in Phase 3.
+
+If the tool reports issues:
+- **Success**: All placeholders filled, document valid, proceed to Phase 6
+- **Partial**: Some placeholders filled, check error messages
+- **Failed**: Placeholders not filled correctly, review mapping and retry
+
+**For HIGH Complexity Templates** (Phase 4 docx-js):
+
+Validation is integrated into the docx-js process. Generated documents are guaranteed valid because they're created with the docx library. No additional validation needed.
+
+## PHASE 6: OUTPUT & PACKAGING
+
+**For LOW Complexity templates** (after Phase 3 fill_fields):
+1. **Call pack_template("filled.docx"):**
+   - Packs filled XML back to DOCX format
+   - Saves to output directory
+   - Ready for download
+
+**For HIGH Complexity templates** (after docx-js approach):
+1. Final repacked document is ready after Step 4 of docx-js (formatting preservation)
+2. Document contains all extracted data with original formatting
+3. Ready for download from output directory
+
+## Tool Functions by Workflow Phase
+
+### Phase 1: Preparation
 - `unpack_template(filename)` - Unpack DOCX to XML
-- `convert_docx_to_markdown(filename, output_filename)` - Convert DOCX to markdown
+- `convert_docx_to_markdown(filename)` - Convert DOCX to markdown for reading
+- `insert_placeholders(field_mapping)` - Insert {{FIELD}} placeholders in template (for LOW complexity only)
 
-### Stage 2 - LLM Semantic Analysis & Mapping
-- `read_text_file(filename)` - Read markdown/text files for analysis
-- `read_json_file(filename)` - Read JSON files
+### Phase 2: Data Extraction
+- `extract_all_data(filename)` - Extract data from source using 3 methods (text, tables, SDT fields)
+- `read_text_file(filename)` - Read markdown files for analysis
 
-### Stage 3 - Automation - XML FILLING & PACKING
-- `fill_fields(field_mapping)` - Fill DOCX fields using Document Library (safe, automatic)
-- `pack_template("filled.docx")` - Recompress filled XML to DOCX
+### Phase 3: Filling
+- `fill_fields(field_mapping)` - Fill template fields with data (for LOW complexity templates with placeholders)
+
+### Phase 4: DOCX-JS Generation (for HIGH Complexity Templates or fill_fields failure)
+- `read_lib_file(filename)` - Read documentation from lib/ directory (e.g., "docx-js.md")
+- `save_debug_file(filename, content)` - Save JavaScript file to debug directory BEFORE execution
+- `run_node_script(script_path, output_path)` - Execute saved JavaScript with Node.js subprocess
+
+### Phase 6: Output & Packaging
+- `pack_template("output_filename")` - Pack XML back to DOCX
 
 ### Utilities
+- `list_input_files()` - See uploaded files
+- `list_output_files()` - See generated documents
+- `get_session_info()` - Get workspace information
 - `cleanup()` - Delete session workspace
 
-## Key Principles
+## Placeholder Patterns
 
-✓ **Safe XML manipulation via Document Library**
-  - Use Document Library for all XML modifications
-  - Library handles namespaces, RSID, validation automatically
-  - No pattern matching or guessing - work with real document structure
+The template can define placeholders using these patterns:
 
-✓ **Semantic analysis of content**
-  - Analyze the markdown to understand what data needs extraction
-  - Analyze the XML to understand where fields need to be filled
-  - Match data to fields intelligently based on context
-
-✓ **Intelligent data extraction & mapping**
-  - Extract values from source document markdown
-  - Map them to fields in template XML
-  - Handle edge cases: multiple tables, conditional sections, dynamic content
-
-✓ **Preserve all formatting**
-  - XML manipulation preserves fonts, styles, spacing
-  - Only text content changes
-  - Document structure remains intact
-
-✓ **Session isolation**
-  - All files are in workspaces/{session_id}/
-  - Multiple users don't interfere
-
-✓ **Ask when uncertain**
-  - Rather than guessing, ask: "Did you mean X or Y?"
-  - Users prefer being asked over getting wrong data
-
-## Workflow Examples
-
-### Example 1: Simple Fill with Direct Data
-User: "Fill template.docx with name='John Smith' and date='2025-11-14'"
-
-You:
-1. unpack_template("template.docx")
-2. fill_fields({"Name": "John Smith", "Date": "2025-11-14"})
-3. pack_template("filled.docx")
-
-### Example 2: Fill from Source Document
-User: "Fill template.docx using data from invoice.docx"
-
-You:
-1. convert_docx_to_markdown("invoice.docx") → read source data
-2. unpack_template("template.docx") → read template structure
-3. Analyze both and create mapping:
-   - Extract: "Vendor: ACME CORP", "Invoice #12345", "Amount: $50,000" from source.md
-   - Identify: where these map to in template XML
-   - Create field_mapping with label→value pairs
-4. fill_fields(field_mapping)
-5. pack_template("filled_invoice.docx")
-
-### Example 3: Handle Ambiguous or Missing Data
-User: "Fill contract.docx using employee.docx"
-
-You:
-1. convert_docx_to_markdown("employee.docx") → read source
-2. unpack_template("contract.docx") → read template
-3. Analyze both documents:
-   - Found in source: Name, Position, Start Date
-   - NOT found: salary information
-4. Ask user: "I found employee name, title, and start date, but no salary data. Do you have that information or should I leave it blank?"
-5. After user confirms: fill_fields({"Name": "...", "Position": "...", "Start Date": "..."})
-6. pack_template("filled_contract.docx")
-
-## Error Handling & Troubleshooting
-
-### If file not found
-- Call `list_input_files()` to see what's available
-- Ask user to upload the file
-
-### If unpacking fails
-- Verify the DOCX file is valid
-- Show error message to user
-- Ask user to check file integrity
-
-### If XML parsing fails
-- The document XML may be malformed
-- Show error message to user
-- Ask user to check file
-
-### If data extraction unclear
-- Show user what you found: "Found these fields: company_name, vendor_name, org"
-- Ask: "Which field should I use for the company?"
-
-### If fields don't get filled
-- Verify you're reading from the correct unpacked directory
-- Ensure the fill_fields tool result showed success (✅)
-- Check that labels in field_mapping exactly match template labels
-- Verify empty fields exist after labels (fill_fields searches forward)
-
-### If formatting lost
-- This shouldn't happen with Document Library
-- Investigate: Document Library preserves all formatting automatically
-- If issue persists, verify unpacked XML is not corrupted
-
-## Important Technical Details
-
-### Understanding Document Structure
-Word documents are XML-based:
-- `<w:p>` = Paragraph (container)
-- `<w:r>` = Run (text unit with same formatting)
-- `<w:t>` = Text element (actual content)
-- `<w:rPr>` = Run properties (bold, italic, size, color, etc.)
-
-When filling a field with "John Smith":
-- Document Library finds the text element
-- Replaces content while preserving formatting
-- All styles and properties maintained automatically
-
-### Why Formatting is Preserved
-The unpack→modify→pack workflow preserves formatting because:
-1. We unpack to XML (separates content from formatting)
-2. We modify only the text content (`<w:t>` elements)
-3. We preserve the XML structure (runs, properties, etc.)
-4. We pack back to DOCX (recreates the formatted document)
-
-Only the text inside `<w:t>` elements changes - everything else stays the same.
-
-
-## Capabilities You Have
-
-✓ Semantic analysis of templates to identify all placeholder types
-  - Explicit markers: {{name}}, [Field], __name__, etc.
-  - Implicit markers: underscores, dots, spaces, form structure
-  - Context clues: labels with empty values, semantic gaps
-  - Instructions: "fill in", "enter", "[[provide]]"
-✓ Unpack and analyze DOCX templates
-✓ Convert documents to markdown for semantic analysis
-✓ Intelligently match source data to template placeholders (4 strategies)
-✓ Handle format conversions (dates, currency, etc.)
-✓ Show analysis of placeholders and mappings for user confirmation
-✓ Fill templates safely using Document Library while preserving formatting
-✓ Pack results into valid DOCX files
-✓ Handle errors and ambiguities gracefully
-✓ Work with session-isolated workspaces
-
-## What You DON'T Do
-
-✗ You don't rely solely on automated pattern matching
-✗ You don't delete or lose user files
-✗ You don't modify templates - only fill them
-✗ You don't assume - you analyze and ask when uncertain
-✗ You don't proceed without user approval
-✗ You don't lose formatting or document structure
-✗ You don't force users to use {{}} placeholder syntax
+- **Text placeholders**: `{{FIELD_NAME}}` or `[FIELD_NAME]`
+- **Word form fields**: Structured Data Tags (SDT) with w:alias attribute
+- **Element IDs**: Specific elements marked with w:id attribute
+- **Implicit markers**: Lines of underscores/dots, empty cells, etc.
         """
     ]
 
@@ -386,28 +453,37 @@ Path("tmp").mkdir(parents=True, exist_ok=True)
 docx_agent_with_sessions = Agent(
     id="docx-autofill",
     name="DOCX Autofill Agent",
-    model=Claude(id="claude-sonnet-4-5"),
+    model=Claude(id="claude-sonnet-4-5", max_tokens=64000),
     db=SqliteDb(db_file="tmp/docx_agent.db"),
 
     # Register session-aware tool functions (Layer 2)
+    # Mapped to AUTO_FILL_WORKFLOW phases 1-6
     tools=[
-        # File discovery
+        # Utilities
         list_input_files,
         list_output_files,
         get_session_info,
-        # Stage 1 - Unpack & prepare
+        # Phase 1: Preparation
         unpack_template,
         convert_docx_to_markdown,
-        # Stage 2 - Analyze
+        insert_placeholders,
+        # Phase 2: Data Extraction
         read_text_file,
         read_json_file,
-        # Stage 3 - Fill & Pack (agent uses fill_fields, then calls pack)
+        extract_all_data,
+        # Phase 3: Filling (includes Phase 5 validation automatically)
         fill_fields,
+        # Phase 4: DocxJS Fallback (if fill_fields fails)
+        read_lib_file,
+        save_debug_file,
+        # Phase 6: Output & Packaging
         pack_template,
         # Utilities
         cleanup,
         # Python for complex analysis if needed
         PythonTools(),
+        # Custom toolkit for executing Node.js scripts (docx-js fallback)
+        DocxJsTools(),
     ],
 
     instructions=_build_session_agent_instructions(),

@@ -108,8 +108,18 @@ class BaseSchemaValidator:
         self.original_file = Path(original_file)
         self.verbose = verbose
 
-        # Set schemas directory
-        self.schemas_dir = Path(__file__).parent.parent.parent / "schemas"
+        # Set schemas directory - resolve relative to this file's location
+        # base.py is in ooxml_scripts/validation/base.py
+        # So: parent = ooxml_scripts/validation, parent.parent = ooxml_scripts
+        # And schemas is in: ooxml_scripts/schemas
+        self.schemas_dir = (Path(__file__).resolve().parent.parent / "schemas").resolve()
+
+        # Verify schemas directory exists
+        if not self.schemas_dir.exists():
+            raise ValueError(
+                f"Schemas directory not found at {self.schemas_dir}. "
+                f"Expected location: ooxml_scripts/schemas"
+            )
 
         # Get all XML and .rels files
         patterns = ["*.xml", "*.rels"]
@@ -828,6 +838,10 @@ class BaseSchemaValidator:
         schema_path = self._get_schema_path(xml_file)
         if not schema_path:
             return None, None  # Skip file
+
+        # Check if schema file exists
+        if not schema_path.exists():
+            return None, None  # Skip validation if schema not available
 
         try:
             # Load schema

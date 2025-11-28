@@ -75,3 +75,8 @@ htmlcov/
 *.tmp
 *.temp
 .cache/
+
+# Node.js dependencies (use npm install to restore)
+node_modules/
+npm-debug.log
+yarn-error.log
